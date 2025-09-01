@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* theme tokens used by CSS-only pieces */
+:root {
+  --bg: #0b0f19;
+}
+
+/* background */
+body {
+  background:
+    radial-gradient(1200px 800px at -10% -20%, rgba(94,234,212,.12), transparent 60%),
+    radial-gradient(1200px 800px at 120% 120%, rgba(59,130,246,.10), transparent 60%),
+    var(--bg, #0b0f19);
+  color: #e5e7eb;
+}
+
+/* glass panel helper */
+.glass {
+  @apply bg-white/5 backdrop-blur-xl border border-white/10 shadow-card;
+}
+
+/* markdown niceties  */
+.prose p { margin: 0.25rem 0; }
+.prose code { background: rgba(255,255,255,.06); padding: .15rem .35rem; border-radius: .35rem; }
+.prose pre code { background: transparent; padding: 0; }
+
+/*  scrollbars */
+*::-webkit-scrollbar { height: 10px; width: 10px; }
+*::-webkit-scrollbar-thumb { background: #1f2a3b; border-radius: 10px; }
+
+/* message animation */
+.bubble-enter { animation: pop .18s ease-out; }
+@keyframes pop {
+  from { transform: translateY(4px) scale(.98); opacity: .6; }
+  to   { transform: translateY(0)   scale(1);   opacity: 1; }
+}
+/* center column  */
+.chat-wrap { max-width: 820px; margin: 0 auto; }
+
+/* code block header  */
+.prose pre { position: relative; }
+.code-header {
+  position:absolute; top:6px; right:8px; font-size:12px;
+  background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08);
+  padding:.15rem .4rem; border-radius:.4rem;
+}
+
+/* message row: avatar + bubble */
+.msg { display:flex; gap:.75rem; align-items:flex-start; }
+.msg.me { flex-direction: row-reverse; }
+.avatar {
+  height: 28px; width: 28px; border-radius: 9999px;
+  display:grid; place-items:center; font-size:.7rem;
+  color:#0b0f19; background:#5eead4; font-weight:700;
+}
+.avatar.me { background:#93c5fd; }
+.msg-actions { opacity:0; transition:opacity .15s ease; font-size:12px; }
+.msg:hover .msg-actions { opacity:1; }
+
+
+/* Centered chat column  */
+.chat-wrap {
+    max-width: 980px;  
+    width: 100%;
+    margin: 0 auto;
+    padding-left: .5rem;
+    padding-right: .5rem;
+  }
+  
+ 
+  .min-h-0 { min-height: 0; }
+  
+  .chat-wrap { max-width: 1040px; }

@@ -1,0 +1,13 @@
+node_modules/
+.npm/
+.pnpm-store/
+.next/
+out/
+dist/
+build/
+*.log
+.env
+.env.*
+# monorepo cache
+apps/**/node_modules/
+packages/**/node_modules/

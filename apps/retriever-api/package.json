@@ -1,0 +1,21 @@
+{
+    "name": "retriever-api",
+    "version": "1.0.0",
+    "type": "module",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "@qdrant/js-client-rest": "1.11.0",
+        "busboy": "1.6.0",
+        "cors": "2.8.5",
+        "dotenv": "16.4.5",
+        "express": "4.19.2",
+        "jose": "^6.1.0",
+        "node-fetch": "3.3.2",
+        "openai": "4.57.0",
+        "pdf-parse": "1.1.1",
+        "pg": "8.12.0"
+    }
+}
