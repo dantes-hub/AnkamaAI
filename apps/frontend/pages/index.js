@@ -39,12 +39,16 @@ export default function Home() {
   async function handleFilesSelected(filesList){
     const fd = new FormData();
     filesList.forEach(f => fd.append('file', f));
-    const res = await ingest(fd, 'demo-tenant', 'kb');
-    try {
-      const out = await listFiles('demo-tenant', 'kb');
-      setFiles(out.files||[]);
-    } catch {}
-    return res;
+     try {
+           const res = await ingest(fd, 'demo-tenant', 'kb');
+           const out = await listFiles('demo-tenant', 'kb');
+           setFiles(out.files || []);
+           return res;
+         } catch (e) {
+           console.error('INGEST_UI_ERROR', e);
+           alert(e.message || 'Upload failed');
+           throw e;
+         }
   }
 
   async function handleAsk(q, opt={}){

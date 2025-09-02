@@ -13,11 +13,15 @@ export async function listFiles(tenant='demo-tenant', project='kb') {
     if (!res.ok) throw new Error(`files failed: ${res.status}`);
     return res.json();
   }
-  
+
 export async function ingest(formData, tenant='demo-tenant', project='kb') {
-  const url = `${BASE}/ingest?tenant_id=${tenant}&project_id=${project}`;
-  const res = await fetch(url, { method: 'POST', body: formData, headers: authHeaders() });
-  return res.json();
+    const url = `${BASE}/ingest?tenant_id=${tenant}&project_id=${project}`;
+    const res = await fetch(url, { method: 'POST', body: formData, headers: authHeaders() });
+    if (!res.ok) {
+    const text = await res.text().catch(()=> '');
+    throw new Error(`ingest failed: ${res.status} ${text}`);
+    }
+    return res.json();
 }
 
 export async function ask(query, opts={}) {
