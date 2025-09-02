@@ -6,6 +6,8 @@ import crypto from 'crypto';
 import OpenAI from 'openai';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import * as jose from 'jose';
+import { spawn } from 'node:child_process';
+
 
 const {
     SUPABASE_URL,
@@ -133,23 +135,74 @@ async function waitPg() {
 // df-parse 
 let pdfParse;
 async function parsePdf(buffer) {
+  // 1) Try pdf-parse (pdf.js)
   if (!pdfParse) {
-    pdfParse = (await import('pdf-parse/lib/pdf-parse.js')).default;
+    try { pdfParse = (await import('pdf-parse')).default; }
+    catch { pdfParse = (await import('pdf-parse/lib/pdf-parse.js')).default; }
   }
-  const { text } = await pdfParse(buffer);
+
+  // silence only the noisy font warning
+  const origWarn = console.warn;
+  try {
+    console.warn = (...args) => {
+      const msg = String(args[0] || '');
+      if (msg.includes('font private use area')) return;
+      origWarn(...args);
+    };
+    const { text } = await pdfParse(buffer);
+    if (text && text.trim().length) return text;
+  } catch (e) {
+    // fall through to pdftotext
+  } finally {
+    console.warn = origWarn;
+  }
+
+  // 2) Fallback to pdftotext (Poppler)
+  const text = await new Promise((resolve) => {
+    try {
+      const proc = spawn('pdftotext', ['-layout', '-q', '-', '-'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '';
+      proc.stdout.on('data', (d) => (out += d.toString('utf8')));
+      proc.on('error', () => resolve(''));
+      proc.on('close', () => resolve(out));
+      proc.stdin.end(buffer);
+    } catch {
+      resolve('');
+    }
+  });
+
   return text || '';
 }
 
 //  Qdrant collection
-async function ensureCollection() {
-  try {
-    await qdrant.getCollection(QDRANT_COLLECTION);
-  } catch {
-    await qdrant.createCollection(QDRANT_COLLECTION, {
-      vectors: { size: 1536, distance: 'Cosine' }, // text-embedding-3-small
-    });
+const MODEL_DIMS = {
+    'text-embedding-3-small': 1536,
+    'text-embedding-3-large': 3072,
+  };
+  const VECTOR_SIZE = MODEL_DIMS[EMBED_MODEL] || 1536;
+  
+  async function ensureCollection() {
+    try {
+      const info = await qdrant.getCollection(QDRANT_COLLECTION);
+      const existing =
+        info?.result?.config?.params?.vectors?.size ??
+        info?.result?.config?.params?.vectors?.config?.size; // handle older/newer schemas
+      if (existing && Number(existing) !== Number(VECTOR_SIZE)) {
+        console.warn(
+          `Qdrant collection '${QDRANT_COLLECTION}' has size=${existing}, expected=${VECTOR_SIZE}. Recreating...`
+        );
+        await qdrant.deleteCollection(QDRANT_COLLECTION).catch(() => {});
+        await qdrant.createCollection(QDRANT_COLLECTION, {
+          vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
+        });
+      }
+    } catch {
+      await qdrant.createCollection(QDRANT_COLLECTION, {
+        vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
+      });
+    }
   }
-}
+  
 ensureCollection().catch(console.error);
 
 //  Utils 
@@ -157,7 +210,58 @@ function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
-function chunkText(text, size = 450, overlap = 90) {
+function safeSnippet(s, max = 2000) {
+    if (!s) return '';
+    // strip NULs and control chars, collapse whitespace, then cap length
+    const cleaned = String(s).replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
+    return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
+  }
+  
+  function validatePoints(points, dim) {
+    for (let i = 0; i < points.length; i++) {
+      const v = points[i]?.vector;
+      if (!Array.isArray(v) || v.length !== dim) {
+        throw new Error(`qdrant_bad_vector_len idx=${i} len=${Array.isArray(v) ? v.length : typeof v}`);
+      }
+      for (let j = 0; j < v.length; j++) {
+        const x = v[j];
+        if (typeof x !== 'number' || !Number.isFinite(x)) {
+          throw new Error(`qdrant_bad_vector_value idx=${i} pos=${j} val=${x}`);
+        }
+      }
+    }
+  }
+  
+  async function upsertPointsBatched(qdrant, collection, points, batchSize = 128) {
+    let total = 0;
+    for (let i = 0; i < points.length; i += batchSize) {
+      const slice = points.slice(i, i + batchSize);
+      try {
+        await qdrant.upsert(collection, { points: slice, wait: true });
+        total += slice.length;
+      } catch (e) {
+        // Print **actual** Qdrant error body if present
+        const details =
+          e?.response?.data ??
+          e?.response?.statusText ??
+          e?.body ??
+          e?.message ??
+          String(e);
+        const sample = slice?.[0]
+          ? {
+              id: slice[0].id,
+              vlen: Array.isArray(slice[0].vector) ? slice[0].vector.length : typeof slice[0].vector,
+              payload_keys: slice[0].payload ? Object.keys(slice[0].payload) : [],
+            }
+          : null;
+        console.error('QDRANT_UPSERT_ERROR_BATCH', { range: `${i}-${i + slice.length - 1}`, details, sample });
+        throw e;
+      }
+    }
+    return total;
+  }
+  
+function chunkText(text, size = 300, overlap = 60) {
   const words = text.split(/\s+/);
   const chunks = [];
   for (let i = 0; i < words.length; i += (size - overlap)) {
@@ -166,11 +270,102 @@ function chunkText(text, size = 450, overlap = 90) {
   }
   return chunks;
 }
+function approxTokens(s) {
+    if (!s) return 0;
+    return Math.ceil(s.length / 4);
+  }
 
+  
+function trimToMaxTokens(text, maxTokens) {
+    if (!text) return '';
+    const toks = approxTokens(text);
+    if (toks <= maxTokens) return text;
+    // naive char-based trim: keep first maxTokens*4 chars
+    const maxChars = maxTokens * 4;
+    return text.slice(0, maxChars);
+  }
+  
 async function embedMany(texts) {
-  const res = await openai.embeddings.create({ model: EMBED_MODEL, input: texts });
-  return res.data.map(d => d.embedding);
-}
+    if (!Array.isArray(texts)) throw new Error('embedMany_invalid_input');
+   
+    // Clean & trim per-item to keep well under 8192
+    const MAX_PER_ITEM = 8000;       // per-item token cap (buffer under 8192)
+    const MAX_PER_REQ  = 280000;     // sum of tokens per request (buffer under 300k)
+    const cleaned = texts
+      .map(t => (t == null ? '' : String(t).trim()))
+      .filter(t => t.length > 0)
+      .map(t => trimToMaxTokens(t, MAX_PER_ITEM));
+   
+    if (!cleaned.length) throw new Error('embedMany_no_valid_texts');
+   
+    const out = [];
+    let batch = [];
+    let batchTok = 0;
+   
+    async function flush() {
+      if (batch.length === 0) return;
+      // Try embedding, adapt if OpenAI complains about request size
+      let current = batch.slice();
+      while (current.length) {
+        try {
+          const res = await openai.embeddings.create({
+            model: EMBED_MODEL,
+            input: current,
+          });
+          out.push(...res.data.map(d => d.embedding));
+          current = []; // done
+        } catch (e) {
+          const msg = String(e?.message || e);
+          // If the request is too big, split current in half and retry
+          if (msg.includes('max 300000 tokens') || msg.includes('maximum context length')) {
+            if (current.length === 1) {
+              // single item still too big → trim harder, then retry once
+              current[0] = trimToMaxTokens(current[0], Math.floor(MAX_PER_ITEM * 0.9));
+              // if it still fails, throw
+              if (approxTokens(current[0]) > MAX_PER_ITEM) throw e;
+            } else {
+              const mid = Math.floor(current.length / 2);
+              const left = current.slice(0, mid);
+              const right = current.slice(mid);
+              // recurse by pushing back halves to be flushed
+              // run left now, then right
+              // eslint-disable-next-line no-await-in-loop
+              const leftRes = await openai.embeddings.create({ model: EMBED_MODEL, input: left });
+              out.push(...leftRes.data.map(d => d.embedding));
+              current = right;
+              continue;
+            }
+          } else {
+            throw e;
+          }
+        }
+      }
+      batch = [];
+      batchTok = 0;
+    }
+   
+    for (const s of cleaned) {
+      const t = approxTokens(s);
+      if (t > MAX_PER_ITEM) {
+        // extra safety (should be trimmed already)
+        const trimmed = trimToMaxTokens(s, MAX_PER_ITEM);
+        if (approxTokens(trimmed) > MAX_PER_ITEM) continue; // skip pathological cases
+        // add trimmed version
+        if (batchTok + approxTokens(trimmed) > MAX_PER_REQ) await flush();
+        batch.push(trimmed);
+        batchTok += approxTokens(trimmed);
+        continue;
+      }
+      if (batchTok + t > MAX_PER_REQ) {
+        await flush();
+      }
+      batch.push(s);
+      batchTok += t;
+    }
+    await flush();
+    return out;
+   }
+    
 
 async function multiQueryRewrites(query, n = 3) {
   const prompt = `Rewrite the user's query into ${n} diverse search queries.
@@ -352,16 +547,34 @@ app.post('/ingest', requireAuth, async (req, res) => {
         let text = '';
         if (f.filename.toLowerCase().endsWith('.pdf')) {
           text = await parsePdf(f.buffer);
+          if (!text || !text.trim()) {
+            return res.status(400).json({ ok: false, error: 'no_text_extracted' });
+          }
+          const chunks = chunkText(text).map(s => s.trim()).filter(Boolean);
+          if (!chunks.length) {
+            return res.status(400).json({ ok: false, error: 'no_chunks_after_split' });
+          }
+          
         } else {
           text = f.buffer.toString('utf8');
         }
 
         // Quota guard 
+        // Validate text
+        if (!text || !text.trim()) {
+        return res.status(400).json({ ok: false, error: 'no_text_extracted' });
+        }
+
+        
         const estimatedTokens = Math.min(20000, Math.ceil(text.length / 3));
         if (await enforceQuota(pg, req, res, estimatedTokens)) return;
 
         // Chunk + embed
-        const chunks = chunkText(text);
+        const chunks = chunkText(text).map(s => (typeof s === 'string' ? s.trim() : ''))
+                                     .filter(s => s.length > 0);
+        if (!chunks.length) {
+          return res.status(400).json({ ok: false, error: 'no_chunks_after_split' });
+        }
         const embs = await embedMany(chunks);
 
         // Insert file row
@@ -374,7 +587,7 @@ app.post('/ingest', requireAuth, async (req, res) => {
 
         // Upsert points 
         const points = embs.map((v, i) => ({
-          id: undefined,
+          id: crypto.randomUUID(),   
           vector: v,
           payload: {
             tenant_id, project_id, file_id,
@@ -382,10 +595,48 @@ app.post('/ingest', requireAuth, async (req, res) => {
             chunk_index: i,
             sha256: hash,
             filename: f.filename,
-            text: chunks[i],
+            text: safeSnippet(chunks[i]),
           },
         }));
-        await qdrant.upsert(QDRANT_COLLECTION, { points });
+        // Validate ALL vectors and batch the upserts
+        validatePoints(points, VECTOR_SIZE);
+        await upsertPointsBatched(qdrant, QDRANT_COLLECTION, points, 128);
+        try{
+            // Sanity checks
+            if (!Array.isArray(points) || points.length === 0) {
+                throw new Error('qdrant_no_points_to_upsert');
+            }
+            if (embs.length !== chunks.length) {
+                throw new Error(`qdrant_len_mismatch embs=${embs.length} chunks=${chunks.length}`);
+            }
+            for (let i = 0; i < Math.min(points.length, 3); i++) {
+                const v = points[i].vector;
+                if (!Array.isArray(v) || v.length !== VECTOR_SIZE || v.some(n => typeof n !== 'number' || !isFinite(n))) {
+                throw new Error(`qdrant_bad_vector i=${i} len=${Array.isArray(v) ? v.length : typeof v}`);
+                }
+            }
+            
+            await qdrant.upsert(QDRANT_COLLECTION, { points });
+        }catch(e){
+                const details =
+                e?.response?.data ??
+                e?.response?.statusText ??
+                e?.body ??                    // some versions put JSON here
+                e?.message ??
+                String(e);
+            
+            const sample = points?.[0]
+                ? {
+                    id: points[0].id,
+                    vlen: Array.isArray(points[0].vector) ? points[0].vector.length : typeof points[0].vector,
+                    payload_keys: points[0].payload ? Object.keys(points[0].payload) : [],
+                }
+                : null;
+            
+            console.error('QDRANT_UPSERT_ERROR', details, sample);
+            throw e;
+        }
+       
         totalChunks += chunks.length;
 
         // Log usage 
@@ -397,10 +648,11 @@ app.post('/ingest', requireAuth, async (req, res) => {
       }
 
       res.json({ ok: true, files: files.length, chunks: totalChunks });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ ok: false, error: e.message });
-    }
+    }  catch (e) {
+          console.error('INGEST_ERROR', { message: e.message, stack: e.stack });
+          const status = (e.message || '').startsWith('embedMany_') ? 400 : 500;
+          res.status(status).json({ ok: false, error: e.message });
+        }
   });
 
   req.pipe(bb);

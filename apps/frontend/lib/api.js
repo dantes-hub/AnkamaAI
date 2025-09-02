@@ -7,6 +7,13 @@ function authHeaders() {
   return AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {};
 }
 
+export async function listFiles(tenant='demo-tenant', project='kb') {
+    const url = `${BASE}/files?tenant_id=${tenant}&project_id=${project}`;
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) throw new Error(`files failed: ${res.status}`);
+    return res.json();
+  }
+  
 export async function ingest(formData, tenant='demo-tenant', project='kb') {
   const url = `${BASE}/ingest?tenant_id=${tenant}&project_id=${project}`;
   const res = await fetch(url, { method: 'POST', body: formData, headers: authHeaders() });

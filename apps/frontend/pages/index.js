@@ -5,7 +5,7 @@ import ChatBox from '../components/ChatBox';
 import FilesPanel from '../components/FilesPanel';
 import SettingsDrawer from '../components/SettingsDrawer';
 import PromptChips from '../components/PromptChips';
-import { ingest, ask } from '../lib/api';
+import { ingest, ask, listFiles } from '../lib/api';
 
 function newId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 function getMsgs(id){ try { return JSON.parse(localStorage.getItem(`ankhai_chat_${id}`)||'[]'); } catch { return []; } }
@@ -41,7 +41,7 @@ export default function Home() {
     filesList.forEach(f => fd.append('file', f));
     const res = await ingest(fd, 'demo-tenant', 'kb');
     try {
-      const out = await fetch('/api/files?tenant_id=demo-tenant&project_id=kb').then(r=>r.json());
+      const out = await listFiles('demo-tenant', 'kb');
       setFiles(out.files||[]);
     } catch {}
     return res;
