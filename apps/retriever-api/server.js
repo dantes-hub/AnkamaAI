@@ -65,9 +65,10 @@ const {
       req.user = { id: payload.sub, email: payload.email };
   
       //  multi-tenant mapping by email domain 
-      const domain = (payload.email || '').split('@')[1] || 'demo';
-      req.tenant_id = `tenant-${domain}`;
-  
+      const explicitTenant = payload?.app_metadata?.tenant_id;
+      const userSub        = payload?.sub;
+      
+      req.tenant_id = explicitTenant || userSub || 'demo-tenant';
       next();
     } catch (e) {
       return res.status(401).json({ ok:false, error:'invalid_token', details: e.message });
@@ -781,6 +782,7 @@ Answer:`;
 //  Tiny files API 
 app.get('/files', requireAuth, async (req, res) => {
   const project_id = req.query.project_id || 'kb';
+  console.log("tnalskf", req.tenant_id)
   try {
     const { rows } = await pg.query(
       `select id, filename, pages, created_at
@@ -814,6 +816,7 @@ app.delete('/files/:id', requireAuth, async (req, res) => {
   }
 });
 
+  
 //  Start 
 waitPg()
   .then(() =>
