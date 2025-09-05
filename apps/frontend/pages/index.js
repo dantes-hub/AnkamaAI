@@ -1,137 +1,229 @@
-import { useEffect, useState } from 'react';
+// apps/frontend/pages/index.js
+import { useEffect, useState, useCallback } from 'react';
 import Sidebar from '../components/Sidebar';
-import Topbar from '../components/Topbar';
-import ChatBox from '../components/ChatBox';
-import FilesPanel from '../components/FilesPanel';
-import SettingsDrawer from '../components/SettingsDrawer';
-import PromptChips from '../components/PromptChips';
-import { ingest, ask, listFiles } from '../lib/api';
-import { supabase } from '../lib/supabase'
-
-function newId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
-function getMsgs(id){ try { return JSON.parse(localStorage.getItem(`ankhai_chat_${id}`)||'[]'); } catch { return []; } }
+import Chat from '../components/Chat';
+import { listFiles, ingest as ingestFormData, deleteFile as deleteFileApi, ask, setAuthToken } from '../lib/api';
+import { supabase, getAccessToken } from '../lib/supabase';
 
 export default function Home() {
+  // Tabs: 'chat' | 'library'
+  const [activeTab, setActiveTab] = useState('chat');
   const [model, setModel] = useState('gpt-4o-mini');
-  const [chatId, setChatId] = useState(null);
-  const [activeTab, setActiveTab] = useState('chat'); 
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settings, setSettings] = useState(()=>({
-    model: 'gpt-4o-mini', top_k: 8, mmr_lambda: 0.5, theme: 'dark'
-  }));
+
+  // Auth-derived identity (or demo fallback)
+  const [tenant, setTenant] = useState('demo-tenant');
+  const [userId, setUserId] = useState('demo-user');
+  const [user, setUser] = useState(null);
+
+  // Files + UI state
   const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [hasToken, setHasToken] = useState(false);
 
-    const [token, setToken] = useState(null);
+  // ---- Bootstrap auth (set global token ONCE) ----
+  useEffect(() => {
+    let sub = null;
 
-    // Restore and subscribe to Supabase session (token)
-    useEffect(() => {
-      let mounted = true;
-      supabase.auth.getSession().then(({ data }) => {
-        if (!mounted) return;
-        setToken(data?.session?.access_token ?? null);
-      });
-      const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
-        setToken(session?.access_token ?? null);
-      });
-      return () => {
-        mounted = false;
-        sub?.subscription?.unsubscribe?.();
-      };
-    }, []);
+    (async () => {
+      try {
+        const token = await getAccessToken();
+        setAuthToken(token);
+        setHasToken(!!token);
 
-  // bootstrap a chat if none exists
-  useEffect(()=>{
-    const list = JSON.parse(localStorage.getItem('ankhai_chats')||'[]');
-    if (list.length===0){
-      const id = newId();
-      localStorage.setItem('ankhai_chats', JSON.stringify([{ id, title:'New chat', updatedAt: Date.now() }]));
-      localStorage.setItem(`ankhai_chat_${id}`, JSON.stringify([]));
-      setChatId(id);
-    } else {
-      setChatId(list[0].id);
-    }
+        const { data } = await supabase.auth.getSession();
+        const session = data?.session || null;
+        if (session?.user) {
+          setUser(session.user);
+          const t = session.user.app_metadata?.tenant_id || session.user.id || 'demo-tenant';
+          setTenant(t);
+          setUserId(session.user.id || 'demo-user');
+        } else {
+          setUser(null);
+          setTenant('demo-tenant');
+          setUserId('demo-user');
+        }
+
+        sub = supabase.auth.onAuthStateChange(async (_evt, sess) => {
+          const tok = sess?.access_token || null;
+          setAuthToken(tok);
+          setHasToken(!!tok);
+          if (sess?.user) {
+            setUser(sess.user);
+            const t2 = sess.user.app_metadata?.tenant_id || sess.user.id || 'demo-tenant';
+            setTenant(t2);
+            setUserId(sess.user.id || 'demo-user');
+          } else {
+            setUser(null);
+            setTenant('demo-tenant');
+            setUserId('demo-user');
+          }
+        });
+      } catch (e) {
+        // If Supabase not configured, stay in demo mode (but backend requiring JWT will 401)
+        setAuthToken(null);
+        setHasToken(false);
+      } finally {
+        setAuthReady(true);
+      }
+    })();
+
+    return () => {
+      try { sub?.data?.subscription?.unsubscribe?.(); } catch {}
+    };
   }, []);
 
-  // keep model in settings in sync
-  useEffect(()=> setSettings(s=>({...s, model})), [model]);
+  const signedIn = !!user;
 
-    // Fetch files only when we have a token (and when Library tab is active)
-    useEffect(() => {
-    if (!token) return;
-        // optional: only fetch when switching to Library
-        if (activeTab !== 'library') return;
-        listFiles('demo-tenant', 'kb', token)
-        .then((d) => setFiles(d.files || []))
-        .catch((e) => console.error('files list error', e));
-    }, [token, activeTab]);
-    
-  async function handleFilesSelected(filesList){
-    const fd = new FormData();
-    filesList.forEach(f => fd.append('file', f));
-     try {
-           const res = await ingest(fd, 'demo-tenant', 'kb', token);
-           const out = await listFiles('demo-tenant', 'kb', token);
-           setFiles(out.files || []);
-           return res;
-         } catch (e) {
-           console.error('INGEST_UI_ERROR', e);
-           alert(e.message || 'Upload failed');
-           throw e;
-         }
+  // ---- Data helpers ----
+  const refreshFiles = useCallback(async () => {
+    // Avoid the 401 on first load: only hit the API when we actually have a token
+    if (!hasToken) return;
+    try {
+      const res = await listFiles(tenant, 'kb'); // server may derive tenant from JWT
+      setFiles(res.files || []);
+    } catch (e) {
+      console.error('LIST_FILES_ERROR', e);
+    }
+  }, [tenant, hasToken]);
+
+  useEffect(() => { refreshFiles(); }, [refreshFiles]);
+
+  // Upload from Sidebar
+  async function handleUpload(selectedFiles) {
+    if (!selectedFiles?.length) return;
+    if (!hasToken) { alert('Please sign in before uploading.'); return; }
+    setLoading(true);
+    try {
+      const fd = new FormData();
+      selectedFiles.forEach(f => fd.append('file', f));
+      const res = await ingestFormData(fd, tenant, 'kb');
+      if (!res?.ok) alert(res?.error || 'Upload failed');
+      await refreshFiles();
+      setActiveTab('library');
+    } catch (e) {
+      console.error('INGEST_UI_ERROR', e);
+      alert(e.message || 'Upload failed');
+    } finally {
+      setLoading(false);
+    }
   }
 
-  async function handleAsk(q, opt={}){
-    return ask(q, { top_k: settings.top_k, mmr_lambda: settings.mmr_lambda, model, ...opt });
+  async function handleDelete(id) {
+    if (!id) return;
+    if (!hasToken) { alert('Please sign in before deleting.'); return; }
+    if (!confirm('Delete this file and its chunks?')) return;
+    try {
+      await deleteFileApi(id, tenant, 'kb');
+      await refreshFiles();
+    } catch (e) {
+      console.error('DELETE_FILE_ERROR', e);
+      alert(e.message || 'Delete failed');
+    }
+  }
+
+  async function handleAsk(q) {
+    // ask works with/without auth depending on your backend; if auth is required it will use the global token
+    return ask(q, { tenant_id: tenant, project_id: 'kb', user_id: userId, top_k: 8 });
+  }
+
+  // Sign in/out (Google example)
+  async function handleSignIn() {
+    try { await supabase.auth.signInWithOAuth({ provider: 'google' }); }
+    catch (e) { alert(e.message || 'Sign-in failed'); }
+  }
+  async function handleSignOut() {
+    try {
+      await supabase.auth.signOut();
+      setAuthToken(null);
+      setHasToken(false);
+      setUser(null);
+      setTenant('demo-tenant');
+      setUserId('demo-user');
+      setFiles([]);
+    } catch (e) {
+      alert(e.message || 'Sign-out failed');
+    }
   }
 
   return (
-    <div className="h-screen grid grid-cols-[18rem_minmax(0,1fr)]"> {}
-        <Sidebar
-        chatId={chatId} setChatId={setChatId}
-        onFilesSelected={handleFilesSelected}
-        model={model} setModel={setModel}
-        activeTab={activeTab} setActiveTab={setActiveTab}
-        />
+    <div className="h-screen grid grid-cols-[18rem_1fr]">
+      <Sidebar
+        onFilesSelected={handleUpload}
+        model={model}
+        setModel={setModel}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        signedIn={signedIn}
+        onSignIn={handleSignIn}
+        onSignOut={handleSignOut}
+        userEmail={user?.email || null}
+      />
 
-      {/* RIGHT PANE */}
-      <div className="flex flex-col min-h-0">     {}
-        <Topbar
-          onRegenerate={()=>{}}
-          onSettings={()=>setSettingsOpen(true)}
-        />
-
-        <div className="flex-1 min-h-0 overflow-hidden">
-        {activeTab === 'chat' && (
-        <div className="flex flex-col h-full min-h-0">
-            {}
-            {!chatId || getMsgs(chatId).length === 0 ? (
-            <div className="chat-wrap px-4 shrink-0">
-                <PromptChips onPick={(p)=>{
-                const ta=document.querySelector('textarea');
-                if(ta){ ta.value=p; ta.focus(); ta.setSelectionRange(p.length,p.length); }
-                }}/>
-            </div>
-            ) : null}
-
-            {}
-            <div className="chat-wrap flex-1 min-h-0">
-            <ChatBox chatId={chatId} onAsk={handleAsk} model={model} />
-            </div>
+      <div className="flex flex-col">
+        <div className="h-12 border-b border-gray-800 flex items-center px-4 justify-between">
+          <div className="font-medium">Knowledge Chat</div>
+          <div className="text-sm text-[var(--muted)]">
+            {loading
+              ? 'Uploading…'
+              : signedIn
+                ? `Signed in${user?.email ? ` as ${user.email}` : ''}`
+                : 'Demo mode'}
+          </div>
         </div>
-        )}
 
-          {activeTab==='library' && <FilesPanel files={files} />}
+        <div className="flex-1">
+          {activeTab === 'chat' ? (
+            <Chat onAsk={handleAsk} />
+          ) : (
+            <div className="h-full overflow-auto">
+              <div className="border-b border-gray-800 flex items-center justify-between px-3 py-2">
+                <div className="text-sm text-[var(--muted)]">
+                  Tenant: <span className="text-teal-300">{tenant}</span> · Project:{' '}
+                  <span className="text-teal-300">kb</span>
+                </div>
+                <button
+                  onClick={refreshFiles}
+                  className="text-xs px-2 py-1 bg-white/5 border border-white/10 rounded hover:bg-white/10"
+                  title="Refresh file list"
+                  disabled={!hasToken}
+                >
+                  Refresh
+                </button>
+              </div>
 
-          {activeTab==='settings' && (
-            <div className="p-6 chat-wrap text-sm text-muted">
-              Use the drawer (top right) to adjust settings.
+              {!authReady ? (
+                <div className="p-3 text-sm text-[var(--muted)]">Checking session…</div>
+              ) : !hasToken ? (
+                <div className="p-3 text-sm text-[var(--muted)]">Sign in to view your library.</div>
+              ) : files?.length === 0 ? (
+                <div className="p-3 text-sm text-[var(--muted)]">
+                  No files yet. Upload PDFs or TXT from the left.
+                </div>
+              ) : (
+                <div className="divide-y divide-gray-800">
+                  {files.map((f) => (
+                    <div key={f.id} className="flex items-center justify-between px-3 py-2">
+                      <div className="truncate">
+                        <div className="text-sm font-medium truncate">{f.filename}</div>
+                        <div className="text-xs text-[var(--muted)]">
+                          {f.created_at ? new Date(f.created_at).toLocaleString() : ''}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleDelete(f.id)}
+                        className="text-xs px-2 py-1 border border-red-400/40 text-red-300 bg-red-500/10 rounded hover:bg-red-500/20"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
       </div>
-
-      <SettingsDrawer open={settingsOpen} onClose={()=>setSettingsOpen(false)}
-                      settings={settings} onChange={setSettings} />
     </div>
   );
 }
