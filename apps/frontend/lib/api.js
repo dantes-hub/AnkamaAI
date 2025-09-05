@@ -7,10 +7,12 @@ function authHeaders() {
   return AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {};
 }
 
-export async function listFiles(tenant='demo-tenant', project='kb') {
-    const url = `${BASE}/files?tenant_id=${tenant}&project_id=${project}`;
-    const res = await fetch(url, { headers: authHeaders() });
-    if (!res.ok) throw new Error(`files failed: ${res.status}`);
+export async function listFiles(tenantId, projectId, token) {
+    const url = `${process.env.NEXT_PUBLIC_BACKEND_URL}/files?tenant_id=${tenantId}&project_id=${projectId}`;
+    const res = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {}, // ← important
+    });
+    if (!res.ok) throw new Error(`files failed: ${res.status} ${await res.text()}`);
     return res.json();
   }
 

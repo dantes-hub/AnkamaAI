@@ -6,6 +6,7 @@ import FilesPanel from '../components/FilesPanel';
 import SettingsDrawer from '../components/SettingsDrawer';
 import PromptChips from '../components/PromptChips';
 import { ingest, ask, listFiles } from '../lib/api';
+import { supabase } from '../lib/supabase'
 
 function newId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 function getMsgs(id){ try { return JSON.parse(localStorage.getItem(`ankhai_chat_${id}`)||'[]'); } catch { return []; } }
@@ -19,6 +20,24 @@ export default function Home() {
     model: 'gpt-4o-mini', top_k: 8, mmr_lambda: 0.5, theme: 'dark'
   }));
   const [files, setFiles] = useState([]);
+
+    const [token, setToken] = useState(null);
+
+    // Restore and subscribe to Supabase session (token)
+    useEffect(() => {
+      let mounted = true;
+      supabase.auth.getSession().then(({ data }) => {
+        if (!mounted) return;
+        setToken(data?.session?.access_token ?? null);
+      });
+      const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
+        setToken(session?.access_token ?? null);
+      });
+      return () => {
+        mounted = false;
+        sub?.subscription?.unsubscribe?.();
+      };
+    }, []);
 
   // bootstrap a chat if none exists
   useEffect(()=>{
@@ -36,12 +55,22 @@ export default function Home() {
   // keep model in settings in sync
   useEffect(()=> setSettings(s=>({...s, model})), [model]);
 
+    // Fetch files only when we have a token (and when Library tab is active)
+    useEffect(() => {
+    if (!token) return;
+        // optional: only fetch when switching to Library
+        if (activeTab !== 'library') return;
+        listFiles('demo-tenant', 'kb', token)
+        .then((d) => setFiles(d.files || []))
+        .catch((e) => console.error('files list error', e));
+    }, [token, activeTab]);
+    
   async function handleFilesSelected(filesList){
     const fd = new FormData();
     filesList.forEach(f => fd.append('file', f));
      try {
-           const res = await ingest(fd, 'demo-tenant', 'kb');
-           const out = await listFiles('demo-tenant', 'kb');
+           const res = await ingest(fd, 'demo-tenant', 'kb', token);
+           const out = await listFiles('demo-tenant', 'kb', token);
            setFiles(out.files || []);
            return res;
          } catch (e) {
